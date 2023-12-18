@@ -10,12 +10,14 @@ import (
 	"time"
 
 	fwext "github.com/aws/aws-k8s-tester/e2e2/internal/framework_extensions"
+	helm "github.com/mittwald/go-helm-client"
+	"github.com/mittwald/go-helm-client/values"
 	"github.com/pkg/errors"
+	"helm.sh/helm/v3/pkg/repo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
-	rbac "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/e2e-framework/klient"
@@ -24,7 +26,6 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
-	"sigs.k8s.io/e2e-framework/third_party/helm"
 )
 
 var testenv env.Environment
@@ -105,41 +106,42 @@ func installLatestCNI(config *envconf.Config, ctx context.Context) error {
 	repoUrl := "https://aws.github.io/eks-charts"
 	chartName := "eks/aws-vpc-cni"
 	releaseNamespace := "kube-system"
+	releaseName := "aws-vpc-cni"
 
-	client, err := config.NewClient()
-
+	client, err := helm.New(&helm.Options{})
 	if err != nil {
-		return errors.Wrap(err, "Failed to get client")
+		return err
 	}
 
-	// Delete Cluster role
-	client.Resources().Delete(ctx, &rbac.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "aws-node", Namespace: releaseNamespace}})
-
-	// Delete Cluster-Role Binding
-	client.Resources().Delete(ctx, &rbac.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "aws-node", Namespace: releaseNamespace}})
-
-	// Delete ServiceAccount
-	client.Resources().Delete(ctx, &v1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "aws-node", Namespace: releaseNamespace}})
-
-	// Delete Daemonset
-	client.Resources().Delete(ctx, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "aws-node", Namespace: releaseNamespace}})
-
-	// Delete Configmap
-	client.Resources().Delete(ctx, &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "amazon-vpc-cni", Namespace: releaseNamespace}})
-
-	manager := helm.New(config.KubeconfigFile())
-	if err := manager.RunRepo(helm.WithArgs("add", repoName, repoUrl)); err != nil {
-		return errors.Wrap(err, "failed to add eks-charts repository")
+	chartRepo := repo.Entry{
+		Name: repoName,
+		URL:  repoUrl,
 	}
 
-	if err := manager.RunRepo(helm.WithArgs("update")); err != nil {
-		return errors.Wrap(err, "failed to upgrade eks-charts repo")
+	if err := client.AddOrUpdateChartRepo(chartRepo); err != nil {
+		return err
 	}
 
-	err = manager.RunInstall(helm.WithChart(chartName), helm.WithNamespace(releaseNamespace),
-		helm.WithArgs("--generate-name", "--set", "enableNetworkPolicy=true", "--set", "originalMatchLabels=true"),
-		helm.WithWait(), helm.WithTimeout("5m"))
+	// Using helm template to generate the yaml file instead of using helm install
+	// as it involves importing resources into the chart
+	chartSpec := &helm.ChartSpec{
+		ReleaseName: releaseName,
+		ChartName:   chartName,
+		Namespace:   releaseNamespace,
+		UpgradeCRDs: true,
+		Wait:        true,
+		ValuesOptions: values.Options{
+			Values: []string{"enableNetworkPolicy=true", "originalMatchlabels=true"},
+		},
+		Timeout: time.Minute * 5,
+	}
 
+	manifest, err := client.TemplateChart(chartSpec, &helm.HelmTemplateOptions{})
+	if err != nil {
+		return err
+	}
+
+	err = fwext.ApplyManifests(config.Client().RESTConfig(), manifest)
 	if err != nil {
 		return err
 	}
@@ -148,7 +150,7 @@ func installLatestCNI(config *envconf.Config, ctx context.Context) error {
 		ObjectMeta: metav1.ObjectMeta{Name: "aws-node", Namespace: releaseNamespace},
 	}
 
-	err = wait.For(fwext.NewConditionExtension(client.Resources()).DaemonSetReady(cniDS), wait.WithTimeout(time.Minute*5))
+	err = wait.For(fwext.NewConditionExtension(config.Client().Resources()).DaemonSetReady(cniDS), wait.WithTimeout(time.Minute*5))
 	if err != nil {
 		return err
 	}
